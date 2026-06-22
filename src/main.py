@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from src.database import Base, engine
 from src.exceptions import register_exception_handlers
-from src.api import events, moderation
+from src.api import events, moderation, queue
 
-# ВАЖНО: импортируем модели ПЕРЕД create_all
+# Импортируем модели ПЕРЕД create_all
 from src.models import event, moderation_card
 
 app = FastAPI(title="NeoMarket Moderation Service")
@@ -14,6 +14,7 @@ register_exception_handlers(app)
 
 app.include_router(events.router)
 app.include_router(moderation.router)
+app.include_router(queue.router)  # ✅ Добавлено
 
 
 @app.get("/")

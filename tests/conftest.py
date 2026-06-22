@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 from src.database import Base, get_db
 from src.main import app
 from src.config import settings
+from src.models.moderation_card import ModerationCard
+from src.models.event import ProcessedEvent
 
 
 TEST_DATABASE_URL = "sqlite:///./test.db"
@@ -36,6 +38,10 @@ def db_session(engine):
     try:
         yield db
     finally:
+        # ✅ Очистка таблиц между тестами — изоляция
+        db.query(ModerationCard).delete()
+        db.query(ProcessedEvent).delete()
+        db.commit()
         db.rollback()
         db.close()
 
@@ -67,7 +73,6 @@ def valid_jwt_with_fixed_id():
     return token, expected_user_id
 
 
-# ✅ НОВАЯ ФИКСТУРА для межсервисной авторизации
 @pytest.fixture
 def valid_service_headers():
     """Заголовки с валидным межсервисным ключом."""
