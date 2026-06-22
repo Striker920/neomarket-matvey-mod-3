@@ -17,6 +17,7 @@ from src.main import app
 from src.config import settings
 from src.models.moderation_card import ModerationCard
 from src.models.event import ProcessedEvent
+from src.models.blocking_reason import BlockingReason
 
 
 TEST_DATABASE_URL = "sqlite:///./test.db"
@@ -41,6 +42,7 @@ def db_session(engine):
         # ✅ Очистка таблиц между тестами — изоляция
         db.query(ModerationCard).delete()
         db.query(ProcessedEvent).delete()
+        db.query(BlockingReason).delete()  # ✅ Добавлено для US-MOD-06
         db.commit()
         db.rollback()
         db.close()
@@ -75,5 +77,5 @@ def valid_jwt_with_fixed_id():
 
 @pytest.fixture
 def valid_service_headers():
-    """Заголовки с валидным межсервисным ключом."""
+    """Заголовки с валидным межсервисным ключом (для US-MOD-01)."""
     return {"X-Service-Key": settings.B2B_SERVICE_KEY}
