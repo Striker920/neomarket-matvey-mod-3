@@ -1,50 +1,124 @@
-# NeoMarket Moderation Service
+# feat(us-mod-02): получение следующей карточки из очереди
 
-Сервис модерации товаров для платформы NeoMarket.
+## 🎯 Цель
 
-## Структура
+Реализовать endpoint получения следующей карточки из очереди модерации с защитой от race-conditions и поддержкой 4 очередей приоритизации.
 
-```
-src/
-├── api/
-│   └── events.py          # POST /api/v1/events/product
-├── models/
-│   ├── product_moderation.py
-│   └── field_report.py
-├── schemas/
-│   └── event.py
-├── services/
-│   └── event_service.py
-├── dependencies/
-│   └── service_key.py
-├── config.py
-├── database.py
-├── exceptions.py
-└── main.py
-```
+## 🔍 Контекст
 
-## Запуск
+Очередь модерации — узкое горло маркетплейса. Чем дольше карточка ждёт — тем дольше продавец без выручки. Модератор нажимает «Следующая» — система мгновенно отдаёт ему самую старую PENDING-карточку и закрепляет за ним. Двое нажали одновременно — никто не должен получить чужую карточку.
 
-```bash
-pip install -r requirements.txt
-uvicorn src.main:app --reload
-```
+## ✅ Что реализовано
 
-## Тесты
+### Endpoint
+`POST /api/v1/queue/claim`
 
-```bash
-pytest tests/ -v
-```
+### Request
+- **Заголовок**: `X-Moderator-Id` (обязательный)
+- **Тело**: `{"queue_priority": 1..4}` (опционально)
 
-## US-MOD-01: Приём событий от B2B
+### Response
+- **200 OK** — карточка в формате TicketResponse
+- **204 No Content** — пустая очередь
+- **409 Conflict** — у модератора уже есть IN_REVIEW
+- **401 Unauthorized** — нет заголовка X-Moderator-Id
+- **422 Unprocessable Entity** — невалидный queue_priority
 
-**Endpoint:** `POST /api/v1/events/product`
+### Бизнес-логика
 
-**Event types:**
-- `CREATED` — создаёт карточку в PENDING
-- `EDITED` — возвращает в PENDING очередь
-- `DELETED` — удаляет карточку
+1. **Проверка активной карточки**: если у модератора уже есть IN_REVIEW → 409
+2. **Выбор карточки**:
+   - Если `queue_priority` указан — искать только в этой очереди
+   - Если `queue_priority = null` — автоперебор 1→4
+3. **Закрепление**: перевод в IN_REVIEW + закрепление за модератором
 
-**Auth:** X-Service-Key
+### 4 очереди приоритизации
 
-**Response:** `{"accepted": true}`
+| Приоритет | Описание |
+|-----------|----------|
+| 1 | Новые товары (созданные впервые) |
+| 2 | Исправленные после блокировки |
+| 3 | Изменённые в наличии |
+| 4 | Изменённые не в наличии |
+
+### Защита от race-conditions (ADR)
+
+#### Рассмотренные варианты
+
+| # | Вариант | Плюсы | Минусы |
+|---|---------|-------|--------|
+| 1 | **SELECT FOR UPDATE SKIP LOCKED** (PostgreSQL) | ✅ Надёжная блокировка на уровне БД | Требует PostgreSQL |
+| 2 | **Redis lock** | Гибкость, работает с любой БД | Дополнительные зависимости, сложность отладки |
+| 3 | **Отдельный queue-сервис** | Масштабируемость | Избыточно для MVP |
+
+#### Решение — **Вариант 1: SELECT FOR UPDATE SKIP LOCKED**
+
+**Обоснование по критериям:**
+
+1. **Сложность отладки:**
+   - Минимальная — блокировка на уровне БД, стандартный механизм
+   - Не требует дополнительной инфраструктуры (Redis, queue-сервис)
+   - Легко мониторить через pg_stat_activity
+
+2. **Дополнительные зависимости:**
+   - Отсутствуют — используется только PostgreSQL
+   - Не требует Redis или внешних сервисов
+
+3. **Поведение при отказе модератора:**
+   - Карточка остаётся в IN_REVIEW с закреплённым модератором
+   - Требуется background job для возврата в PENDING через N минут (реализуется в US-MOD-03)
+
+**Реализация:**
+- **PostgreSQL**: `SELECT ... FOR UPDATE SKIP LOCKED` — пропускает заблокированные строки
+- **SQLite** (тесты): `BEGIN IMMEDIATE` транзакция — блокирует всю БД на время транзакции
+
+## 📂 Изменения в файлах
+
+### `src/schemas/queue.py` (НОВЫЙ)
+- `ClaimRequest` — схема запроса
+- `TicketResponse` — схема ответа
+
+### `src/services/queue_service.py` (НОВЫЙ)
+- `claim_card()` — основная логика
+- `_find_oldest_pending_postgres()` — FOR UPDATE SKIP LOCKED
+- `_find_oldest_pending_sqlite()` — обычная выборка
+
+### `src/api/queue.py` (НОВЫЙ)
+- `POST /api/v1/queue/claim`
+- Зависимость `get_moderator_id()` для извлечения заголовка
+
+### `tests/test_queue.py` (НОВЫЙ)
+- 8 тестов покрывают все сценарии канона
+
+## 🧪 Тестовое покрытие
+
+| # | Тест | Статус |
+|---|------|:------:|
+| 1 | `test_next_returns_oldest_pending` | ✅ |
+| 2 | `test_concurrent_two_moderators_get_different_cards` | ✅ |
+| 3 | `test_empty_queue_returns_204` | ✅ |
+| 4 | `test_moderator_already_has_in_review_returns_409` | ✅ |
+| 5 | `test_queue_priority_filter` | ✅ |
+| 6 | `test_auto_priority_scans_queues_1_to_4` | ✅ |
+| 7 | `test_missing_moderator_id_returns_401` | ✅ |
+| 8 | `test_invalid_queue_priority_returns_422` | ✅ |
+
+**Результат:** `8 passed` ✅
+
+## ✅ Соответствие DoD
+
+| Требование | Статус |
+|---|:---:|
+| `next_returns_oldest_pending` | ✅ |
+| `concurrent_two_moderators_get_different_cards` | ✅ |
+| `empty_queue_returns_204` | ✅ |
+| `moderator_already_has_in_review_returns_409` | ✅ |
+| 4 очереди приоритизации | ✅ |
+| ADR в описании PR | ✅ |
+| 4+ pytest | ✅ (8 тестов) |
+
+## 🔗 Связанные задачи
+
+- **US-MOD-01** — приём событий о товаре от B2B (создаёт карточки в PENDING)
+- **US-MOD-02** — получение карточки из очереди (текущая задача)
+- **US-MOD-03** — таймаут IN_REVIEW (возврат в PENDING через N минут) — следующая задача
