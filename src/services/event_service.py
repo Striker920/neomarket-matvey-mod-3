@@ -1,123 +1,151 @@
 from sqlalchemy.orm import Session
-from src.models.product_moderation import ProductModeration
-from src.models.field_report import ProductModerationFieldReport
-import httpx
+from src.models.event import ProcessedEvent
+from src.models.moderation_card import ModerationCard
+from src.schemas.event import IncomingB2BEvent, ProductEventType
+from datetime import datetime, timezone
 import uuid
-from datetime import datetime
-from src.config import settings
+
+
+class DuplicateEventError(Exception):
+    """Выбрасывается при повторном событии с тем же idempotency_key."""
+    def __init__(self, idempotency_key: str, product_id: str):
+        self.idempotency_key = idempotency_key
+        self.product_id = product_id
+        super().__init__(f"Duplicate event: {idempotency_key}")
 
 
 class EventService:
     def __init__(self, db: Session):
         self.db = db
 
-    def handle_product_event(self, payload: dict) -> dict:
-        product_id = payload.get("product_id")
-        seller_id = payload.get("seller_id")
-        event_type = payload.get("event")
-
-        existing = self.db.query(ProductModeration).filter(
-            ProductModeration.product_id == product_id
+    def process_event(self, event: IncomingB2BEvent) -> dict:
+        """
+        Обработка входящего события от B2B.
+        
+        1. Проверка идемпотентности по idempotency_key → 409 при дубликате
+        2. Маршрутизация по event_type
+        3. Сохранение idempotency_key после успешной обработки
+        """
+        # Дедупликация по idempotency_key (не по product_id!)
+        existing = self.db.query(ProcessedEvent).filter(
+            ProcessedEvent.idempotency_key == event.idempotency_key
         ).first()
-
-        if event_type == "CREATED":
-            return self._handle_created(product_id, seller_id, existing)
-        elif event_type == "EDITED":
-            return self._handle_edited(product_id, existing)
-        elif event_type == "DELETED":
-            return self._handle_deleted(product_id, existing)
-
-        return {"status": "unknown_event"}
-
-    def _handle_created(self, product_id: str, seller_id: str, existing) -> dict:
+        
         if existing:
-            if existing.status == "HARD_BLOCKED":
-                return {"status": "accepted"}
-            return {"status": "duplicate"}
-
-        product_data = self._fetch_product_from_b2b(product_id)
-        if not product_data:
-            return {"status": "b2b_error"}
-
-        total_active = sum(
-            sku.get("active_quantity", 0)
-            for sku in product_data.get("skus", [])
-        )
-
-        moderation = ProductModeration(
-            id=str(uuid.uuid4()),
+            raise DuplicateEventError(
+                idempotency_key=event.idempotency_key,
+                product_id=existing.product_id
+            )
+        
+        product_id = event.payload.product_id
+        seller_id = event.payload.seller_id
+        
+        # Маршрутизация по типу события
+        if event.event_type == ProductEventType.PRODUCT_CREATED:
+            self._handle_created(product_id, seller_id, event)
+        elif event.event_type == ProductEventType.PRODUCT_EDITED:
+            self._handle_edited(product_id, seller_id, event)
+        elif event.event_type == ProductEventType.PRODUCT_DELETED:
+            self._handle_deleted(product_id, event)
+        
+        # Сохраняем idempotency_key ПОСЛЕ успешной обработки
+        processed = ProcessedEvent(
+            idempotency_key=event.idempotency_key,
             product_id=product_id,
-            seller_id=seller_id,
-            status="PENDING",
-            queue_priority=1,
-            json_before=None,
-            json_after=product_data,
-            total_active_quantity=total_active
+            event_type=event.event_type.value,
+            processed_at=datetime.now(timezone.utc)
         )
-        self.db.add(moderation)
+        self.db.add(processed)
         self.db.commit()
+        
+        return {
+            "status": "accepted",
+            "idempotency_key": event.idempotency_key,
+            "product_id": product_id,
+        }
 
-        return {"status": "accepted"}
-
-    def _handle_edited(self, product_id: str, existing) -> dict:
-        if not existing:
-            return {"status": "not_found"}
-
-        if existing.status == "HARD_BLOCKED":
-            return {"status": "accepted"}
-
-        product_data = self._fetch_product_from_b2b(product_id)
-        if not product_data:
-            return {"status": "b2b_error"}
-
-        old_status = existing.status
-
-        total_active = sum(
-            sku.get("active_quantity", 0)
-            for sku in product_data.get("skus", [])
-        )
-
-        if old_status == "BLOCKED":
-            queue_priority = 2
-        elif old_status == "MODERATED":
-            queue_priority = 3 if total_active > 0 else 4
+    def _handle_created(self, product_id: str, seller_id: str, event: IncomingB2BEvent):
+        """
+        CREATED: создаём карточку модерации в статусе PENDING.
+        """
+        existing = self.db.query(ModerationCard).filter(
+            ModerationCard.product_id == product_id
+        ).first()
+        
+        product_data = event.payload.product_data or {}
+        now = datetime.now(timezone.utc)
+        
+        if existing:
+            existing.status = "PENDING"
+            existing.seller_id = seller_id or existing.seller_id
+            existing.json_before = None
+            existing.json_after = product_data
+            existing.queue_priority = 1
+            existing.date_updated = now
         else:
-            queue_priority = existing.queue_priority
+            card = ModerationCard(
+                id=str(uuid.uuid4()),
+                product_id=product_id,
+                seller_id=seller_id or "unknown",
+                status="PENDING",
+                queue_priority=1,
+                json_before=None,
+                json_after=product_data,
+                blocking_reason_id=None,
+                moderator_id=None,
+                moderator_comment=None,
+                date_created=now,
+                date_updated=now,
+                date_moderation=None,
+            )
+            self.db.add(card)
 
-        existing.json_before = existing.json_after
-        existing.json_after = product_data
-        existing.status = "PENDING"
-        existing.queue_priority = queue_priority
-        existing.moderator_id = None
-        existing.total_active_quantity = total_active
-        existing.date_updated = datetime.utcnow()
+    def _handle_edited(self, product_id: str, seller_id: str, event: IncomingB2BEvent):
+        """
+        EDITED: обновляем карточку.
+        
+        - json_before ← json_after (предыдущий снапшот)
+        - json_after ← новые данные
+        - статус:
+          * MODERATED/BLOCKED → возвращается в PENDING
+          * IN_REVIEW → обновляются поля, остаётся в IN_REVIEW
+          * HARD_BLOCKED → игнорируется (терминальный статус)
+        """
+        card = self.db.query(ModerationCard).filter(
+            ModerationCard.product_id == product_id
+        ).first()
+        
+        if not card:
+            return
+        
+        if card.status == "HARD_BLOCKED":
+            return
+        
+        product_data = event.payload.product_data or {}
+        now = datetime.now(timezone.utc)
+        
+        card.json_before = card.json_after
+        card.json_after = product_data
+        card.date_updated = now
+        
+        if card.status in ("MODERATED", "BLOCKED"):
+            card.status = "PENDING"
+            card.queue_priority = 1
+            card.moderator_id = None
+            card.moderator_comment = None
+            card.date_moderation = None
+        elif card.status == "IN_REVIEW":
+            pass
+        elif card.status == "PENDING":
+            pass
 
-        self.db.query(ProductModerationFieldReport).filter(
-            ProductModerationFieldReport.product_moderation_id == existing.id
-        ).delete()
-
-        self.db.commit()
-
-        return {"status": "accepted"}
-
-    def _handle_deleted(self, product_id: str, existing) -> dict:
-        if not existing:
-            return {"status": "accepted"}
-
-        self.db.delete(existing)
-        self.db.commit()
-
-        return {"status": "accepted"}
-
-    def _fetch_product_from_b2b(self, product_id: str) -> dict | None:
-        try:
-            with httpx.Client() as client:
-                response = client.get(
-                    f"{settings.B2B_SERVICE_URL}/api/v1/products/{product_id}",
-                    headers={"X-Service-Key": settings.B2B_SERVICE_KEY},
-                    timeout=10.0
-                )
-                response.raise_for_status()
-                return response.json()
-        except Exception:
-            return None
+    def _handle_deleted(self, product_id: str, event: IncomingB2BEvent):
+        """
+        DELETED: удаляем карточку из очереди модерации.
+        """
+        card = self.db.query(ModerationCard).filter(
+            ModerationCard.product_id == product_id
+        ).first()
+        
+        if card:
+            self.db.delete(card)

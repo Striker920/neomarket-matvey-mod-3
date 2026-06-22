@@ -17,7 +17,7 @@ from src.main import app
 from src.config import settings
 
 
-TEST_DATABASE_URL = "sqlite:///./test_moderation.db"
+TEST_DATABASE_URL = "sqlite:///./test.db"
 
 
 @pytest.fixture(scope="session")
@@ -65,3 +65,10 @@ def valid_jwt_with_fixed_id():
     payload = {"sub": expected_user_id}
     token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
     return token, expected_user_id
+
+
+# ✅ НОВАЯ ФИКСТУРА для межсервисной авторизации
+@pytest.fixture
+def valid_service_headers():
+    """Заголовки с валидным межсервисным ключом."""
+    return {"X-Service-Key": settings.B2B_SERVICE_KEY}
